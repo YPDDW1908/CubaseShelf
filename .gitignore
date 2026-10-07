@@ -1,0 +1,17 @@
+.DS_Store
+.build/
+*.app/
+*.zip
+*.dSYM/
+work/
+library.json
+*.cpr
+*.bak
+*.csh
+*.wav
+*.aif
+*.aiff
+*.mp3
+*.m4a
+*.flac
+*.caf
