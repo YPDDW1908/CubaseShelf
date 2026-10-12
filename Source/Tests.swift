@@ -20,6 +20,88 @@ import AVFoundation
             try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000 + age)], ofItemAtPath: url.path)
             return url
         }
+        let noteTime = Date(timeIntervalSince1970: 1700000000)
+        var historyNote = Annotation(); historyNote.notes = "旧计划"; historyNote.cubaseVersion = 14
+        NoteHistory.edit(&historyNote, text: "新计划", now: noteTime)
+        NoteHistory.edit(&historyNote, text: "新计划 ", now: noteTime.addingTimeInterval(120))
+        expect(historyNote.noteHistory == nil && historyNote.notes == "新计划 ", "Typing including spaces and long pauses creates no history")
+        NoteHistory.checkpoint(&historyNote, now: noteTime)
+        expect(historyNote.noteHistory?.count == 1, "Manual save creates a revision")
+        let retained = historyNote.noteHistory!
+        NoteHistory.checkpoint(&historyNote, now: noteTime)
+        expect(historyNote.noteHistory == retained, "Repeated manual save deduplicates unchanged content")
+        NoteHistory.edit(&historyNote, text: "不同内容", now: noteTime)
+        expect(historyNote.noteHistory == retained, "Editing does not alter manually retained revisions")
+        NoteHistory.restore(&historyNote, id: retained[0].id)
+        expect(historyNote.notes == "新计划 " && historyNote.noteHistory == retained, "Direct restore changes draft without adding history")
+        NoteHistory.edit(&historyNote, text: "先保存我")
+        NoteHistory.checkpoint(&historyNote)
+        NoteHistory.restore(&historyNote, id: retained[0].id)
+        expect(historyNote.noteHistory?.count == 2 && historyNote.noteHistory?.last?.text == "先保存我", "Explicit save then restore preserves current draft")
+        NoteHistory.edit(&historyNote, text: " \n\t")
+        NoteHistory.checkpoint(&historyNote)
+        expect(historyNote.noteHistory?.count == 2, "Blank manual save adds no history")
+        let deleteID = retained[0].id
+        NoteHistory.delete(&historyNote, id: deleteID)
+        expect(historyNote.noteHistory?.count == 1 && historyNote.deletedNotes?.count == 1, "Manual history can be deleted")
+        var roundtrip = try JSONDecoder().decode(Annotation.self, from: JSONEncoder().encode(historyNote))
+        expect(roundtrip.deletedNotes == historyNote.deletedNotes && roundtrip.cubaseVersion == 14, "History deletion persists alongside Cubase preference")
+        NoteHistory.undelete(&roundtrip, id: deleteID)
+        expect(roundtrip.noteHistory?.count == 2, "Undo deletion restores history")
+        NoteHistory.undelete(&roundtrip, id: deleteID)
+        expect(roundtrip.noteHistory?.count == 2, "Repeated undo is idempotent")
+        expect(ProjectRelocation.annotation(roundtrip, from: "/old", to: "/new").noteHistory == roundtrip.noteHistory, "Relocation preserves manual history")
+        var legacyBlank = Annotation()
+        legacyBlank.noteHistory = [NoteRevision(date: noteTime, text: "", reason: "自动留存"), NoteRevision(date: noteTime, text: "旧内容", reason: "自动留存")]
+        NoteHistory.cleanBlankHistory(&legacyBlank); NoteHistory.cleanBlankHistory(&legacyBlank)
+        expect(legacyBlank.noteHistory?.count == 1 && legacyBlank.deletedNotes?.count == 1, "Legacy nonempty auto history preserved and blanks archived once")
+        await MainActor.run {
+            let noteURL = root.appendingPathComponent("manual-notes.json")
+            let noteStore = LibraryStore(persistenceURL: noteURL, observesSystem: false)
+            noteStore.update("project-A") { $0.notes = "计划" }
+            noteStore.update("project-A") { $0.notes += " " }
+            noteStore.selectedID = "project-A"; noteStore.selectedID = "project-B"
+            noteStore.save()
+            expect(noteStore.annotation("project-A").noteHistory == nil, "Store typing selection and autosave never add history")
+            noteStore.checkpointNotes("project-A")
+            expect(noteStore.annotation("project-A").noteHistory?.count == 1, "Store manual action creates history")
+            noteStore.update("project-A") { $0.notes = "草稿还在" }
+            noteStore.shutdown()
+            let reloaded = try! LibraryPersistence.load(from: noteURL)
+            expect(reloaded.annotations["project-A"]?.notes == "草稿还在" && reloaded.annotations["project-A"]?.noteHistory?.count == 1, "Shutdown saves draft without another history revision")
+        }
+        let mixRoot = "/fixtures/混音"
+        expect(CubaseRouting.version(directory: mixRoot, override: nil, mixingRoot: mixRoot) == 14, "Mixing root opens in 14")
+        expect(CubaseRouting.version(directory: mixRoot + "/Song/Versions", override: nil, mixingRoot: mixRoot) == 14, "Nested mixing project opens in 14")
+        expect(CubaseRouting.version(directory: mixRoot + "备份/Song", override: nil, mixingRoot: mixRoot) == nil, "Similar prefix does not match mixing root")
+        expect(CubaseRouting.version(directory: "/fixtures/编曲/混音歌曲", override: nil, mixingRoot: mixRoot) == nil, "Project title containing mixing does not trigger routing")
+        expect(CubaseRouting.version(directory: mixRoot + "/../编曲/Song", override: nil, mixingRoot: mixRoot) == nil, "Parent traversal respects normalized directory boundary")
+        expect(CubaseRouting.version(directory: mixRoot + "/Song", override: 15, mixingRoot: mixRoot) == 15, "Explicit 15 overrides mixing directory")
+        expect(CubaseRouting.version(directory: "/fixtures/编曲/Song", override: 14, mixingRoot: mixRoot) == 14, "Explicit 14 overrides default directory")
+        expect(CubaseRouting.version(directory: mixRoot, override: 99, mixingRoot: mixRoot) == 14, "Unknown preference safely uses directory rule")
+        var oldNote = Annotation(); oldNote.notes = "旧备注"; oldNote.favorite = true
+        let legacyBytes = try JSONEncoder().encode(oldNote)
+        let legacyNote = try JSONDecoder().decode(Annotation.self, from: legacyBytes)
+        expect(legacyNote.cubaseVersion == nil && legacyNote.notes == "旧备注", "Legacy notes without Cubase preference remain readable")
+        oldNote.cubaseVersion = 15
+        let savedNote = try JSONDecoder().decode(Annotation.self, from: JSONEncoder().encode(oldNote))
+        expect(savedNote.cubaseVersion == 15 && savedNote.favorite, "Project Cubase override persists with existing annotations")
+        let movedNote = ProjectRelocation.annotation(savedNote, from: mixRoot, to: "/fixtures/new")
+        expect(movedNote.cubaseVersion == 15 && movedNote.notes == "旧备注", "Project relocation preserves explicit Cubase version")
+        let oldLibrary = try JSONDecoder().decode(LibraryData.self, from: Data("{\"schemaVersion\":1,\"locations\":[],\"annotations\":{},\"projects\":[],\"cubase\":{\"path\":\"/Applications/Cubase 15.app\"}}".utf8))
+        expect(oldLibrary.cubase14 == nil && oldLibrary.cubase15 == nil && oldLibrary.cubase?.path == "/Applications/Cubase 15.app", "Old library keeps default app without new fields")
+        await MainActor.run {
+            let routingStore = LibraryStore(persistenceURL: root.appendingPathComponent("routing-library.json"), observesSystem: false)
+            routingStore.data.cubase = SavedLocation(path: "/custom/default.app")
+            routingStore.data.cubase14 = SavedLocation(path: "/missing/Cubase 14.app")
+            expect(routingStore.applicationURL(version: nil)?.path == "/custom/default.app", "Default routing preserves previously selected application")
+            expect(routingStore.applicationURL(version: 14)?.path == "/missing/Cubase 14.app", "Missing explicit application does not silently fall back")
+            let entry = FileEntry(path: "/missing/Song.cpr", modified: Date())
+            let missingProject = Project(directory: "/missing", versions: [entry], backups: [], bounces: [])
+            routingStore.openProject(entry, project: missingProject)
+            expect(routingStore.error != nil, "Missing project is rejected before launch")
+            routingStore.shutdown()
+        }
         let main = try file("示例工程/示例工程.cpr")
         let newer = try file("示例工程/示例工程-02.CPR", age: 60)
         _ = try file("示例工程/Auto Saves/示例工程-01-(pad).bak")

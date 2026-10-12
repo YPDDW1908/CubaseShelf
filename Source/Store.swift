@@ -44,11 +44,18 @@ import UniformTypeIdentifiers
                 .appendingPathComponent("CubaseShelf/library.json")
         do { data = try LibraryPersistence.load(from: persistenceURL) }
         catch { self.error = "读取资料库失败，已暂停保存以保护原文件：\(error.localizedDescription)"; writeAllowed = false }
+        // A new process starts a new editing session; persisted drafts stay readable.
+        for id in Array(data.annotations.keys) {
+            data.annotations[id]?.noteDraftID = nil
+            if var note = data.annotations[id] { NoteHistory.cleanBlankHistory(&note); data.annotations[id] = note }
+        }
         data.locations = data.locations.map { resolve($0) }
         for key in Array(data.annotations.keys) {
             data.annotations[key]?.externalAudio = (data.annotations[key]?.externalAudio ?? []).map { resolve($0) }
         }
         if let app = data.cubase { data.cubase = resolve(app) }
+        if let app = data.cubase14 { data.cubase14 = resolve(app) }
+        if let app = data.cubase15 { data.cubase15 = resolve(app) }
         if explicitURL == nil, let root = argument("--import-root") { addRoot(URL(fileURLWithPath: root), refresh: false) }
         if observesSystem { startObservation() }
         refresh()
@@ -66,12 +73,34 @@ import UniformTypeIdentifiers
     }
     func annotation(_ id: String) -> Annotation { data.annotations[id] ?? Annotation() }
     func update(_ id: String, _ change: (inout Annotation) -> Void) {
-        var value = annotation(id); change(&value); data.annotations[id] = value
+        var value = annotation(id); let previousNotes = value.notes
+        change(&value)
+        if value.notes != previousNotes {
+            let newNotes = value.notes; value.notes = previousNotes
+            NoteHistory.edit(&value, text: newNotes)
+        }
+        data.annotations[id] = value
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }; self?.save()
         }
+    }
+    func checkpointNotes(_ id: String) {
+        guard var note = data.annotations[id] else { return }
+        NoteHistory.checkpoint(&note)
+        data.annotations[id] = note; save()
+    }
+    func restoreNote(_ id: String, revision: UUID) {
+        guard var note = data.annotations[id] else { return }
+        NoteHistory.restore(&note, id: revision)
+        data.annotations[id] = note; save()
+    }
+    func deleteNote(_ id: String, revision: UUID, undo: Bool = false) {
+        guard var note = data.annotations[id] else { return }
+        if undo { NoteHistory.undelete(&note, id: revision) }
+        else { NoteHistory.delete(&note, id: revision) }
+        data.annotations[id] = note; save()
     }
     func save() {
         guard writeAllowed else { return }
@@ -237,7 +266,9 @@ import UniformTypeIdentifiers
         closed = true; refreshTask?.cancel(); saveTask?.cancel()
         monitor.stop(); recoveryTimer?.invalidate()
         for (center, observer) in observers { center.removeObserver(observer) }
-        observers.removeAll(); save()
+        observers.removeAll()
+        for id in Array(data.annotations.keys) { data.annotations[id]?.noteDraftID = nil }
+        save()
         for url in accessed.values { url.stopAccessingSecurityScopedResource() }
         accessed.removeAll()
     }
@@ -313,21 +344,44 @@ import UniformTypeIdentifiers
         if project.isOffline && LibraryIndex.contains(file.path, in: project.directory) { return true }
         return !FileManager.default.isReadableFile(atPath: file.path)
     }
-    func chooseCubase() {
+    func chooseCubase(version: Int? = nil) {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.application]; panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.message = "选择用于打开 .cpr 工程的 Cubase 应用"
-        if panel.runModal() == .OK, let url = panel.url { data.cubase = resolve(location(url)); save() }
+        panel.message = version.map { "选择 Cubase \($0) 应用" } ?? "选择默认用于打开工程的 Cubase 应用"
+        if panel.runModal() == .OK, let url = panel.url {
+            if let version, Bundle(url: url)?.bundleIdentifier != "com.steinberg.cubase\(version)" {
+                error = "请选择 Cubase \(version)，避免使用错误版本打开工程。"; return
+            }
+            let app = resolve(location(url))
+            if version == 14 { data.cubase14 = app }
+            else if version == 15 { data.cubase15 = app }
+            else { data.cubase = app }
+            save()
+        }
     }
-    var cubaseURL: URL? {
-        if let saved = data.cubase { return URL(fileURLWithPath: saved.path) }
-        let conventional = URL(fileURLWithPath: "/Applications/Cubase 15.app")
+    func openingVersion(_ project: Project) -> Int? {
+        CubaseRouting.version(directory: project.directory, override: annotation(project.id).cubaseVersion)
+    }
+    func applicationURL(version: Int?) -> URL? {
+        let saved = version == 14 ? data.cubase14 : version == 15 ? data.cubase15 : data.cubase
+        if let saved { return URL(fileURLWithPath: saved.path) }
+        let number = version ?? 15
+        let conventional = URL(fileURLWithPath: "/Applications/Cubase \(number).app")
         if FileManager.default.fileExists(atPath: conventional.path) { return conventional }
-        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.steinberg.cubase15")
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.steinberg.cubase\(number)")
     }
-    func openProject(_ entry: FileEntry) {
+    func openingName(_ project: Project) -> String {
+        let version = openingVersion(project)
+        return applicationURL(version: version)?.deletingPathExtension().lastPathComponent ?? "Cubase \(version ?? 15)"
+    }
+    func openProject(_ entry: FileEntry, project: Project) {
+        guard project.versions.contains(entry) else { error = "所选文件不属于当前工程，请重新选择。"; return }
         guard FileManager.default.fileExists(atPath: entry.path) else { error = "工程文件不存在，请连接硬盘或刷新资料库。"; return }
-        guard let application = cubaseURL, FileManager.default.fileExists(atPath: application.path) else {
-            error = "未找到 Cubase 15。请在侧栏中选择 Cubase 应用，然后重试。"; return
+        let version = openingVersion(project)
+        guard let application = applicationURL(version: version), FileManager.default.fileExists(atPath: application.path) else {
+            error = "未找到 \(openingName(project))。请在工程详情中选择对应应用后重试；不会自动换用其他版本。"; return
+        }
+        if let version, Bundle(url: application)?.bundleIdentifier != "com.steinberg.cubase\(version)" {
+            error = "配置的应用不是 Cubase \(version)，请重新选择对应应用。"; return
         }
         NSWorkspace.shared.open([entry.url], withApplicationAt: application, configuration: NSWorkspace.OpenConfiguration()) { _, error in
             if let error { Task { @MainActor in self.error = "无法打开工程：\(error.localizedDescription)" } }

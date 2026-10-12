@@ -80,7 +80,7 @@ struct ContentView: View {
                                     .contentShape(Rectangle())
                                     .onTapGesture { store.selectedID = project.id }
                                     .contextMenu {
-                                        Button("在 Cubase 中打开最新版本") { if let file = project.versions.first { store.openProject(file) } }.disabled(project.isOffline)
+                                        Button("用 \(store.openingName(project)) 打开最新版本") { if let file = project.versions.first { store.openProject(file, project: project) } }.disabled(project.isOffline)
                                         Button("在 Finder 中显示") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: project.directory) }
                                     }
                                 }
@@ -200,7 +200,7 @@ struct SidebarView: View {
                 }.font(.caption)
             }
             Button("选择 Cubase 应用…") { store.chooseCubase() }.font(.caption).buttonStyle(.plain).foregroundStyle(.secondary)
-            Text("独立开发 · 本地资料库 · v0.8 Alpha").font(.system(size: 9)).foregroundStyle(.secondary)
+            Text("独立开发 · 本地资料库 · v0.10.2 Alpha").font(.system(size: 9)).foregroundStyle(.secondary)
         }.padding(16).frame(maxHeight: .infinity).background(ShelfTheme.sidebar)
     }
     func navigation(_ title: String, _ icon: String) -> some View {
@@ -260,6 +260,7 @@ struct ProjectDetail: View {
     @ObservedObject var player: PreviewPlayer
     let project: Project
     @State private var versionPath = ""
+    @State private var showingNoteHistory = false
     @State private var selectedMetadata: ProjectMetadata?
     var metadataEntry: FileEntry? { project.versions.first { $0.path == versionPath } ?? project.versions.first }
     var annotation: Annotation { store.annotation(project.id) }
@@ -278,10 +279,18 @@ struct ProjectDetail: View {
                 audioList
                 Divider()
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("下次继续做什么").font(.headline)
+                    HStack {
+                        Text("下次继续做什么").font(.headline)
+                        Spacer()
+                        Button("留存当前") { store.checkpointNotes(project.id) }
+                        Button("历史 · \(annotation.noteHistory?.count ?? 0)") {
+                            showingNoteHistory = true
+                        }
+                    }
+                    .sheet(isPresented: $showingNoteHistory) { NoteHistoryView(store: store, projectID: project.id, projectName: project.name) }
                     TextEditor(text: binding(\.notes)).font(.system(size: 13)).scrollContentBackground(.hidden)
                         .frame(minHeight: 90).padding(8).background(panelColor, in: RoundedRectangle(cornerRadius: 8))
-                    Text("备注自动保存在资料库中，不写入 Cubase 工程。").font(.caption2).foregroundStyle(.secondary)
+                    Text("输入内容自动保存；只有点击“留存当前”才新增历史。输入、切换工程和查看历史不会新增记录。").font(.caption2).foregroundStyle(.secondary)
                 }
                 DisclosureGroup("自动备份 · \(project.backups.count) 个") {
                     VStack(alignment: .leading, spacing: 7) {
@@ -324,13 +333,23 @@ struct ProjectDetail: View {
                     .font(.caption).foregroundStyle(ShelfTheme.warning)
             }
             HStack {
-                Button { if let version = project.versions.first(where: { $0.path == versionPath }) ?? project.versions.first { store.openProject(version) } } label: {
-                    Label("在 Cubase 中打开", systemImage: "arrow.up.forward.app")
+                Button { if let version = project.versions.first(where: { $0.path == versionPath }) ?? project.versions.first { store.openProject(version, project: project) } } label: {
+                    Label("用 \(store.openingName(project)) 打开", systemImage: "arrow.up.forward.app")
                 }.buttonStyle(.borderedProminent).tint(ShelfTheme.accent).foregroundStyle(ShelfTheme.onAccent).disabled(project.isOffline)
                 Button { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: project.directory) } label: { Image(systemName: "folder") }.help("显示工程文件夹")
                 Button("重新定位…") { store.relocate(project) }.font(.caption)
                 Spacer()
             }
+            HStack {
+                Picker("打开方式", selection: Binding<Int>(get: { annotation.cubaseVersion ?? 0 }, set: { value in store.update(project.id) { $0.cubaseVersion = value == 0 ? nil : value } })) {
+                    Text("自动（按目录）").tag(0)
+                    Text("Cubase 14").tag(14)
+                    Text("Cubase 15").tag(15)
+                }
+                Button("选择应用…") { store.chooseCubase(version: store.openingVersion(project)) }
+            }.font(.caption)
+            Text(annotation.cubaseVersion == nil ? (store.openingVersion(project) == 14 ? "混音目录规则：使用 Cubase 14" : "使用默认 Cubase 应用") : "此工程已单独指定打开版本")
+                .font(.caption2).foregroundStyle(.secondary)
             Picker("工程版本", selection: $versionPath) {
                 ForEach(project.versions) { file in Text(file.name).tag(file.path) }
             }.font(.caption)
@@ -491,5 +510,73 @@ struct PlayerBar: View {
             }
         }.frame(minWidth:88,alignment:.leading).textSelection(.enabled)
         .help("原始音频读数。LUFS/LRA 支持单声道、立体声和明确布局的 5.1；True Peak 支持 44.1 kHz 及以上。— 表示无法测量。")
+    }
+}
+
+struct NoteHistoryView: View {
+    @ObservedObject var store: LibraryStore
+    let projectID: String
+    let projectName: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var showingDeleted = false
+    @State private var pendingRestore: UUID?
+    @State private var confirmingRestore = false
+    var entries: [NoteRevision] {
+        (showingDeleted ? (store.annotation(projectID).deletedNotes ?? []) : (store.annotation(projectID).noteHistory ?? [])).reversed().filter {
+            query.isEmpty || $0.text.localizedCaseInsensitiveContains(query)
+        }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("备注历史 · " + projectName).font(.headline)
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            HStack {
+                TextField("搜索历史内容", text: $query).textFieldStyle(.roundedBorder)
+                Toggle("已删除 · \(store.annotation(projectID).deletedNotes?.count ?? 0)", isOn: $showingDeleted).toggleStyle(.button)
+            }
+            Text("删除仅移入“已删除”，不改变当前备注；可撤销删除。空白内容不留存，旧版空白记录已移入“已删除”。").font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if entries.isEmpty { Text(query.isEmpty ? (showingDeleted ? "没有已删除记录。" : "还没有备注历史。点击“留存当前”后，记录会显示在这里。") : "没有匹配的记录。").foregroundStyle(.secondary).padding() }
+                    ForEach(entries) { entry in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text(entry.date.formatted(date: .abbreviated, time: .standard)).font(.caption)
+                                Text(entry.reason).font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                if showingDeleted {
+                                    Button("撤销删除") { store.deleteNote(projectID, revision: entry.id, undo: true) }
+                                        .disabled(NoteHistory.isBlank(entry.text))
+                                } else {
+                                Button(entry.text == store.annotation(projectID).notes ? "当前内容" : "恢复此版本") {
+                                    pendingRestore = entry.id; confirmingRestore = true
+                                }.disabled(entry.text == store.annotation(projectID).notes)
+                                Button("删除", role: .destructive) { store.deleteNote(projectID, revision: entry.id) }
+                                }
+                            }
+                            Text(entry.text.isEmpty ? "（空白备注）" : entry.text)
+                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        }.padding(12).background(ShelfTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }.padding(20).frame(width: 720, height: 520).background(ShelfTheme.background)
+        .confirmationDialog("恢复历史备注", isPresented: $confirmingRestore, titleVisibility: .visible) {
+            Button("留存当前并恢复") {
+                guard let id = pendingRestore else { return }
+                store.checkpointNotes(projectID); store.restoreNote(projectID, revision: id)
+            }
+            Button("直接恢复", role: .destructive) {
+                guard let id = pendingRestore else { return }
+                store.restoreNote(projectID, revision: id)
+            }
+            Button("取消", role: .cancel) { pendingRestore = nil }
+        } message: {
+            Text("恢复会替换输入框里的当前内容。可以先手动留存当前内容，或直接恢复；已有历史不变。")
+        }
     }
 }

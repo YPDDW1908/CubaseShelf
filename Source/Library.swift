@@ -71,6 +71,11 @@ struct Annotation: Codable {
     var notes = ""
     var bpm = ""
     var externalAudio: [SavedLocation] = []
+    var noteHistory: [NoteRevision]?
+    var noteDraftID: UUID?
+    var deletedNotes: [NoteRevision]?
+    var suppressedNoteText: String?
+    var cubaseVersion: Int? // nil: directory rule; 14/15: explicit project override
 }
 
 struct LibraryData: Codable {
@@ -79,6 +84,8 @@ struct LibraryData: Codable {
     var annotations: [String: Annotation] = [:]
     var projects: [Project] = []
     var cubase: SavedLocation?
+    var cubase14: SavedLocation?
+    var cubase15: SavedLocation?
     var automaticRefresh: Bool?
     var relocationHistory: [Project]?
 }
@@ -288,5 +295,67 @@ enum LibraryPersistence {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(library).write(to: url, options: .atomic)
+    }
+}
+
+// Match the configured default mixing directory by path boundary, never a title
+// substring or workflow status. Pure function so offline routing is testable.
+enum CubaseRouting {
+    static var mixingRoot: String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/cubase/混音").path
+    }
+    static func version(directory: String, override: Int?, mixingRoot: String = mixingRoot) -> Int? {
+        if let override, [14,15].contains(override) { return override }
+        return LibraryIndex.contains(directory, in: mixingRoot) ? 14 : nil
+    }
+}
+
+struct NoteRevision: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var date: Date
+    var text: String
+    var reason: String
+}
+
+enum NoteHistory {
+    static func isBlank(_ text: String) -> Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    static func cleanBlankHistory(_ note: inout Annotation) {
+        let blanks = (note.noteHistory ?? []).filter { isBlank($0.text) }
+        guard !blanks.isEmpty else { return }
+        note.deletedNotes = (note.deletedNotes ?? []) + blanks
+        note.noteHistory?.removeAll { isBlank($0.text) }
+        if blanks.contains(where: { $0.id == note.noteDraftID }) { note.noteDraftID = nil }
+    }
+    static func delete(_ note: inout Annotation, id: UUID) {
+        guard let entry = note.noteHistory?.first(where: { $0.id == id }) else { return }
+        note.deletedNotes = (note.deletedNotes ?? []) + [entry]
+        note.noteHistory?.removeAll { $0.id == id }
+        if note.noteDraftID == id { note.noteDraftID = nil }
+        if entry.text == note.notes { note.suppressedNoteText = note.notes }
+    }
+    static func undelete(_ note: inout Annotation, id: UUID) {
+        guard let entry = note.deletedNotes?.first(where: { $0.id == id }), !isBlank(entry.text) else { return }
+        note.deletedNotes?.removeAll { $0.id == id }
+        note.noteHistory = ((note.noteHistory ?? []) + [entry]).sorted { $0.date < $1.date }
+        if note.suppressedNoteText == entry.text { note.suppressedNoteText = nil }
+        note.noteDraftID = nil
+    }
+    static func checkpoint(_ note: inout Annotation, now: Date = Date(), reason: String = "手动留存") {
+        cleanBlankHistory(&note)
+        var entries = note.noteHistory ?? []
+        if entries.last?.text != note.notes && !isBlank(note.notes) {
+            entries.append(NoteRevision(date: now, text: note.notes, reason: reason))
+        }
+        note.noteHistory = entries
+        note.noteDraftID = nil
+    }
+    static func edit(_ note: inout Annotation, text: String, now: Date = Date()) {
+        // Editing updates the autosaved draft only. History is explicitly manual.
+        note.notes = text; note.noteDraftID = nil; note.suppressedNoteText = nil
+    }
+
+    static func restore(_ note: inout Annotation, id: UUID, now: Date = Date()) {
+        guard let entry = note.noteHistory?.first(where: { $0.id == id }), !isBlank(entry.text), entry.text != note.notes else { return }
+        edit(&note, text: entry.text, now: now)
     }
 }
